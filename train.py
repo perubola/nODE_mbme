@@ -2,7 +2,7 @@
 # Will be modifying as needed for our purposes
 # https://github.com/google-research/torchsde/blob/master/examples/sde_gan.py
 # ==============================================================================
-"""Train a neural ordinary differential equation (NODE) model."""
+"""Train a neural stochastic differential equation (nSDE) model."""
 
 import torch
 import torch.nn as nn
