@@ -3,7 +3,7 @@
 # https://github.com/google-research/torchsde/blob/master/examples/sde_gan.py
 # ==============================================================================
 """Train a neural stochastic differential equation (nSDE) model."""
-
+import fire
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -17,7 +17,7 @@ import torchsde
 import tqdm
 
 ###################
-# First some standard helper objects.
+# Helper objects
 ###################
 
 class LipSwish(nn.Module):
@@ -68,7 +68,7 @@ class GeneratorFunc(nn.Module):
         # x has shape (batch_size, hidden_size)
         t = t.expand(x.size(0), 1)
         tx = torch.cat([t, x], dim=1)
-        return self._drift(tx), self._diffusion(tx).view(x.size(0), self._hidden_size, self._noise_size)
+        return self._drift(tx), self._diffusion(tx).view(x.size(0), self._hidden_size, self._noise_size).squeeze(2)
 
 ###################
 # Wrap it to compute the SDE
@@ -104,7 +104,7 @@ class Generator(nn.Module):
         ys = self._readout(xs)
 
         # Normalize to data that discriminator expects, in this case time is a channel
-        ts = ts.unsqueeze(0).unsqueeve(-1).expand(batch_size, ts.size(0), 1)
+        ts = ts.unsqueeze(0).unsqueeze(-1).expand(batch_size, ts.size(0), 1)
         return torchcde.linear_interpolation_coeffs(torch.cat([ts, ys], dim=2)) 
     
 # Now CDE stuff
@@ -136,7 +136,7 @@ class Discriminator(nn.Module):
     def forward(self, ys_coeffs):
         # ys_coeffs has shape (batch_size, data_size, 1 + data_size)
         # the +1 lets us handle irregular time as a channel 
-        Y = torchcde.LinearInterpolation(ys_coeffs)
+        Y = torchcde.LinearInterpolation(torch.tensor(ys_coeffs))
         Y0 = Y.evaluate(Y.interval[0])
         h0 = self._initial(Y0)
         hs = torchcde.cdeint(Y, self._func, h0, Y.interval, method='reversible_heun', backend='torchsde',
@@ -148,15 +148,16 @@ class Discriminator(nn.Module):
 # Right now this is for toy data, will replace with real data later 
 def get_data(batch_size, device):
     dataset_size = 100
-    t_size = 100
+    t_size = 64
 
-    ts = torch.linspace(0, 1, 100).to(device)
-    ys = torch.sin(2 * np.pi * ts).to(device)
+    ts = torch.linspace(0, t_size - 1, t_size, device=device)
+    y0 = torch.rand(dataset_size, device=device).unsqueeze(-1) * 2 - 1  # vector for y0
+    ys = y0.mm(torch.sin(2 * np.pi * ts).unsqueeze(0).to(device))
     ###################
     # As discussed, time must be included as a channel for the discriminator.
     ###################
-    ys = torch.cat([ts.unsqueeze(0).unsqueeze(-1).expand(dataset_size, t_size, 1),
-                    ys.transpose(0, 1)], dim=2)
+    ys = torch.cat([ts.unsqueeze(0).expand(dataset_size, t_size).unsqueeze(-1),
+                    ys.unsqueeze(-1)], dim=2)
     
     data_size = ys.size(-1) - 1 # -1 for time channel
     ys_coeffs = torchcde.linear_interpolation_coeffs(ys)
@@ -188,7 +189,7 @@ def get_loss(ts, batch_size, dataloader, generator, discriminator):
 def main(
         # architectural hyperparameters
         initial_noise_size=1,  # noise dimension at start of sde
-        noise_size=3,          # noise dimensions of the brownian motion
+        noise_size=1,          # noise dimensions of the brownian motion
         hidden_size=32,        # hidden size of the generator and discriminator
         mlp_size=32,           # size of the hidden layers of the mlps
         num_layers=2,          # number of hidden layers of the mlps
@@ -196,10 +197,15 @@ def main(
         # training hyperparameters
         generator_lr=1e-3,     # learning rate of the generator
         discriminator_lr=1e-3, # learning rate of the discriminator
-        batch_size=100,        # batch size
+        batch_size=10,        # batch size
         steps=10,              # number of steps to train for
+        init_mult1 = 3,        # scales initial weights and biases for generator
+        init_mult2 = 0.5,
         swa_step_start=5,      # step to start swa
         weight_decay=0.01,     # weight decay
+
+        # logging
+        steps_per_print=1,     # how often to print loss
 ):
     is_cuda = torch.cuda.is_available()
     device = 'cuda' if is_cuda else 'cpu'
@@ -208,7 +214,7 @@ def main(
 
     # Data
     ts, data_size, dataloader = get_data(batch_size=batch_size, device=device)
-
+    infinite_train_dataloader = (elem for it in iter(lambda: dataloader, None) for elem in it)
     # Models
     generator = Generator(data_size, initial_noise_size, noise_size, hidden_size, mlp_size, num_layers).to(device)
     discriminator = Discriminator(data_size, hidden_size, mlp_size, num_layers).to(device)
@@ -216,10 +222,68 @@ def main(
     averaged_generator = swa_utils.AveragedModel(generator)
     averaged_discriminator = swa_utils.AveragedModel(discriminator)
 
-    # need to initialize right
+    # need to initialize the generator right
+    # choose init_mult 1 and 2 to match the variance of the initial data
+    # according to the paper, you could pretrain the generator to match the variance of the data
+    # but I have no clue how to do this 
+    with torch.no_grad():
+        for param in generator._initial.parameters():
+            param *= init_mult1
+        for param in generator._func.parameters():
+            param *= init_mult2
 
     # optimisers. Adadelta is used in the paper
     generator_optimiser = torch.optim.Adadelta(generator.parameters(), lr=generator_lr, weight_decay=weight_decay)
+    discriminator_optimiser = torch.optim.Adadelta(discriminator.parameters(), lr=discriminator_lr, weight_decay=weight_decay)
 
     # training loop
     trange = tqdm.tqdm(range(steps))
+    for step in trange:
+      real_samples, = next(infinite_train_dataloader)
+
+      generated_samples = generator(ts, batch_size)  # creates a batch of generated samples over ts
+      generated_score = discriminator(generated_samples)  # scores the generated samples
+      real_score = discriminator(real_samples)  # scores the real samples
+      loss = generated_score - real_score  # the loss is the difference between the scores
+      loss.backward()  # backpropagate the loss
+
+      for param in generator.parameters():
+          param.grad *= -1
+      generator_optimiser.step()  # update the generator
+      discriminator_optimiser.step()  # update the discriminator
+      generator_optimiser.zero_grad()
+      discriminator_optimiser.zero_grad()
+
+      ###################
+      # constrain lipschitz constant
+      ###################
+      with torch.no_grad():
+          for module in discriminator.modules():
+              if isinstance(module, torch.nn.Linear):
+                  lim = 1 / module.out_features
+                  module.weight.clamp_(-lim, lim)
+
+      # Stochastic weight averaging (SWA) helps GAN training apparently
+      if step > swa_step_start:
+          averaged_generator.update_parameters(generator)
+          averaged_discriminator.update_parameters(discriminator)
+
+      if (step % steps_per_print) == 0 or step == steps - 1:
+          total_unaveraged_loss = get_loss(ts, batch_size, dataloader, generator, discriminator)
+          if step > swa_step_start:
+              total_averaged_loss = get_loss(ts, batch_size, dataloader, averaged_generator.module,
+                                                   averaged_discriminator.module)
+              trange.write(f"Step: {step:3}, Unaveraged loss: {total_unaveraged_loss:.4f} "
+                           f"Averaged loss: {total_averaged_loss:.4f}")
+          else:
+              trange.write(f"Step: {step:3} Unaveraged loss: {total_unaveraged_loss:.4f}")
+
+    generator.load_state_dict(averaged_generator.module.state_dict())
+    discriminator.load_state_dict(averaged_discriminator.module.state_dict())
+
+    _, _, test_dataloader = get_data(batch_size=batch_size, device=device)
+
+if __name__ == '__main__':
+    fire.Fire(main)
+
+
