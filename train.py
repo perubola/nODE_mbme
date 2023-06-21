@@ -136,7 +136,7 @@ class Discriminator(nn.Module):
     def forward(self, ys_coeffs):
         # ys_coeffs has shape (batch_size, data_size, 1 + data_size)
         # the +1 lets us handle irregular time as a channel 
-        Y = torchcde.LinearInterpolation(torch.tensor(ys_coeffs))
+        Y = torchcde.LinearInterpolation(ys_coeffs)
         Y0 = Y.evaluate(Y.interval[0])
         h0 = self._initial(Y0)
         hs = torchcde.cdeint(Y, self._func, h0, Y.interval, method='reversible_heun', backend='torchsde',
@@ -152,7 +152,8 @@ def get_data(batch_size, device):
 
     ts = torch.linspace(0, t_size - 1, t_size, device=device)
     y0 = torch.rand(dataset_size, device=device).unsqueeze(-1) * 2 - 1  # vector for y0
-    ys = y0.mm(torch.sin(2 * np.pi * ts).unsqueeze(0).to(device))
+    # ys = y0.mm(torch.sin(2 * np.pi * ts).unsqueeze(0).to(device))
+    ys = (y0.mm(ts.unsqueeze(0).to(device)))**2
     ###################
     # As discussed, time must be included as a channel for the discriminator.
     ###################
@@ -166,6 +167,8 @@ def get_data(batch_size, device):
 
     return ts, data_size, dataloader
 
+
+    
 ################### 
 # GAN Training
 #
@@ -178,6 +181,7 @@ def get_loss(ts, batch_size, dataloader, generator, discriminator):
         total_samples = 0
         total_loss = 0
         for real_samples in dataloader:
+            real_samples = real_samples[0]  # for some reason real_samples is a list with one element
             generated_samples = generator(ts, batch_size)
             generated_score = discriminator(generated_samples)
             real_score = discriminator(real_samples)
@@ -190,18 +194,18 @@ def main(
         # architectural hyperparameters
         initial_noise_size=1,  # noise dimension at start of sde
         noise_size=1,          # noise dimensions of the brownian motion
-        hidden_size=32,        # hidden size of the generator and discriminator
-        mlp_size=32,           # size of the hidden layers of the mlps
+        hidden_size=64,        # hidden size of the generator and discriminator
+        mlp_size=64,           # size of the hidden layers of the mlps
         num_layers=2,          # number of hidden layers of the mlps
 
         # training hyperparameters
-        generator_lr=1e-3,     # learning rate of the generator
-        discriminator_lr=1e-3, # learning rate of the discriminator
+        generator_lr=2e-4,     # learning rate of the generator
+        discriminator_lr=5e-3, # learning rate of the discriminator
         batch_size=10,        # batch size
-        steps=10,              # number of steps to train for
+        steps=100,              # number of steps to train for
         init_mult1 = 3,        # scales initial weights and biases for generator
         init_mult2 = 0.5,
-        swa_step_start=5,      # step to start swa
+        swa_step_start=50,      # step to start swa
         weight_decay=0.01,     # weight decay
 
         # logging
@@ -239,9 +243,12 @@ def main(
     # training loop
     trange = tqdm.tqdm(range(steps))
     for step in trange:
+      # begin debug
       real_samples, = next(infinite_train_dataloader)
 
       generated_samples = generator(ts, batch_size)  # creates a batch of generated samples over ts
+      # copy the tensor cause cmd gives warning
+    #   gen_samp_clone = generated_samples.clone().detach()
       generated_score = discriminator(generated_samples)  # scores the generated samples
       real_score = discriminator(real_samples)  # scores the real samples
       loss = generated_score - real_score  # the loss is the difference between the scores
@@ -253,7 +260,6 @@ def main(
       discriminator_optimiser.step()  # update the discriminator
       generator_optimiser.zero_grad()
       discriminator_optimiser.zero_grad()
-
       ###################
       # constrain lipschitz constant
       ###################
